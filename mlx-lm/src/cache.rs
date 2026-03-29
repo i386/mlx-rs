@@ -283,7 +283,7 @@ impl KeyValueCache for KVCache {
             .expect("values cache missing")
             .index((.., .., ..end, ..));
         eval([&keys, &values])?;
-        Ok((keys.copy()?, values.copy()?))
+        Ok((keys.contiguous(false)?, values.contiguous(false)?))
     }
 }
 

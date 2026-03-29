@@ -66,6 +66,22 @@ impl Array {
         as_strided_device(self, shape, strides, offset, stream)
     }
 
+    /// See [`contiguous`].
+    #[default_device]
+    pub fn contiguous_device(
+        &self,
+        allow_col_major: impl Into<Option<bool>>,
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        contiguous_device(self, allow_col_major, stream)
+    }
+
+    /// See [`copy`].
+    #[default_device]
+    pub fn copy_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        copy_device(self, stream)
+    }
+
     /// See [`at_least_1d`]
     #[default_device]
     pub fn at_least_1d_device(&self, stream: impl AsRef<Stream>) -> Result<Array> {
@@ -221,6 +237,32 @@ pub fn as_strided_device<'a>(
             stream.as_ref().as_ptr(),
         )
     })
+}
+
+/// Return a contiguous copy of the array.
+#[generate_macro]
+#[default_device]
+pub fn contiguous_device(
+    a: impl AsRef<Array>,
+    #[optional] allow_col_major: impl Into<Option<bool>>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let a = a.as_ref();
+    let allow_col_major = allow_col_major.into().unwrap_or(false);
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_contiguous(res, a.as_ptr(), allow_col_major, stream.as_ref().as_ptr())
+    })
+}
+
+/// Return a copy of the array.
+#[generate_macro]
+#[default_device]
+pub fn copy_device(
+    a: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let a = a.as_ref();
+    Array::try_from_op(|res| unsafe { mlx_sys::mlx_copy(res, a.as_ptr(), stream.as_ref().as_ptr()) })
 }
 
 /// Broadcast an array to the given shape. Returns an error if the shapes are not broadcastable.

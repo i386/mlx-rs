@@ -191,6 +191,16 @@ impl KeyValueCache for KVCache {
     ) -> Result<(Array, Array), Exception> {
         let prev = self.offset;
         let seq_len = keys.shape()[2];
+        if self.keys.is_none() && self.values.is_none() {
+            self.offset = seq_len;
+            self.keys = Some(keys.copy()?);
+            self.values = Some(values.copy()?);
+            return Ok((
+                self.keys.as_ref().expect("keys cache missing").copy()?,
+                self.values.as_ref().expect("values cache missing").copy()?,
+            ));
+        }
+        let mut wrote_current = false;
 
         let needs_resize = self
             .keys
@@ -202,12 +212,12 @@ impl KeyValueCache for KVCache {
             let key_shape = keys.shape();
             let value_shape = values.shape();
             let expand_steps = ((Self::STEP + seq_len - 1) / Self::STEP) * Self::STEP;
-            let new_keys = zeros_dtype(
-                &[key_shape[0], key_shape[1], expand_steps, key_shape[3]],
+            let zero_pad_keys = zeros_dtype(
+                &[key_shape[0], key_shape[1], expand_steps - seq_len, key_shape[3]],
                 keys.dtype(),
             )?;
-            let new_values = zeros_dtype(
-                &[value_shape[0], value_shape[1], expand_steps, value_shape[3]],
+            let zero_pad_values = zeros_dtype(
+                &[value_shape[0], value_shape[1], expand_steps - seq_len, value_shape[3]],
                 values.dtype(),
             )?;
 
@@ -223,26 +233,40 @@ impl KeyValueCache for KVCache {
                     } else {
                         existing_values
                     };
-                    self.keys = Some(concatenate_axis(&[existing_keys, new_keys], -2)?);
-                    self.values = Some(concatenate_axis(&[existing_values, new_values], -2)?);
+                    let copied_keys = keys.copy()?;
+                    let copied_values = values.copy()?;
+                    self.keys = Some(concatenate_axis(
+                        &[existing_keys, copied_keys, zero_pad_keys],
+                        -2,
+                    )?);
+                    self.values = Some(concatenate_axis(
+                        &[existing_values, copied_values, zero_pad_values],
+                        -2,
+                    )?);
+                    wrote_current = true;
                 }
                 _ => {
-                    self.keys = Some(new_keys);
-                    self.values = Some(new_values);
+                    let copied_keys = keys.copy()?;
+                    let copied_values = values.copy()?;
+                    self.keys = Some(concatenate_axis(&[copied_keys, zero_pad_keys], -2)?);
+                    self.values = Some(concatenate_axis(&[copied_values, zero_pad_values], -2)?);
+                    wrote_current = true;
                 }
             }
         }
 
         self.offset += seq_len;
         let end = self.offset;
-        self.keys
-            .as_mut()
-            .expect("keys cache missing")
-            .try_index_mut((.., .., prev..end, ..), &keys)?;
-        self.values
-            .as_mut()
-            .expect("values cache missing")
-            .try_index_mut((.., .., prev..end, ..), &values)?;
+        if !wrote_current {
+            self.keys
+                .as_mut()
+                .expect("keys cache missing")
+                .try_index_mut((.., .., prev..end, ..), &keys)?;
+            self.values
+                .as_mut()
+                .expect("values cache missing")
+                .try_index_mut((.., .., prev..end, ..), &values)?;
+        }
         eval([
             self.keys.as_ref().expect("keys cache missing"),
             self.values.as_ref().expect("values cache missing"),
@@ -259,7 +283,7 @@ impl KeyValueCache for KVCache {
             .expect("values cache missing")
             .index((.., .., ..end, ..));
         eval([&keys, &values])?;
-        Ok((keys.deep_clone(), values.deep_clone()))
+        Ok((keys.copy()?, values.copy()?))
     }
 }
 
@@ -368,5 +392,66 @@ mod tests {
         assert_eq!(values.shape(), &[1, 1, 3, 2]);
         assert_eq!(keys.as_slice::<f32>(), &[1., 2., 3., 4., 9., 10.]);
         assert_eq!(values.as_slice::<f32>(), &[5., 6., 7., 8., 11., 12.]);
+    }
+
+    #[test]
+    fn kv_cache_matches_concat_for_repeated_single_token_appends() {
+        let _guard = test_guard();
+        let mut concat = ConcatKeyValueCache::new();
+        let mut kv = KVCache::new();
+
+        let prefix_len = 220usize;
+        let heads = 2usize;
+        let dim = 64usize;
+        let prefix_elems = heads * prefix_len * dim;
+        let prefix_keys: Vec<f32> = (0..prefix_elems).map(|i| i as f32 / 1000.0).collect();
+        let prefix_values: Vec<f32> = (0..prefix_elems).map(|i| i as f32 / 2000.0).collect();
+        let prefix_keys =
+            Array::from_slice(&prefix_keys, &[1, heads as i32, prefix_len as i32, dim as i32]);
+        let prefix_values =
+            Array::from_slice(&prefix_values, &[1, heads as i32, prefix_len as i32, dim as i32]);
+
+        let (concat_keys, concat_values) = concat
+            .update_and_fetch(prefix_keys.deep_clone(), prefix_values.deep_clone())
+            .expect("seed concat");
+        let (kv_keys, kv_values) = kv
+            .update_and_fetch(prefix_keys, prefix_values)
+            .expect("seed kv");
+        assert!(concat_keys
+            .all_close(&kv_keys, 1e-6, 1e-6, None)
+            .unwrap()
+            .item::<bool>());
+        assert!(concat_values
+            .all_close(&kv_values, 1e-6, 1e-6, None)
+            .unwrap()
+            .item::<bool>());
+
+        for step in 0..8usize {
+            let token_keys: Vec<f32> = (0..(heads * dim))
+                .map(|i| (10_000 + step * heads * dim + i) as f32 / 1000.0)
+                .collect();
+            let token_values: Vec<f32> = (0..(heads * dim))
+                .map(|i| (20_000 + step * heads * dim + i) as f32 / 1000.0)
+                .collect();
+            let token_keys = Array::from_slice(&token_keys, &[1, heads as i32, 1, dim as i32]);
+            let token_values =
+                Array::from_slice(&token_values, &[1, heads as i32, 1, dim as i32]);
+
+            let (concat_keys, concat_values) = concat
+                .update_and_fetch(token_keys.deep_clone(), token_values.deep_clone())
+                .expect("append concat");
+            let (kv_keys, kv_values) = kv
+                .update_and_fetch(token_keys, token_values)
+                .expect("append kv");
+
+            assert!(concat_keys
+                .all_close(&kv_keys, 1e-6, 1e-6, None)
+                .unwrap()
+                .item::<bool>());
+            assert!(concat_values
+                .all_close(&kv_values, 1e-6, 1e-6, None)
+                .unwrap()
+                .item::<bool>());
+        }
     }
 }

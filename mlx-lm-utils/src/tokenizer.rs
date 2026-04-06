@@ -73,7 +73,7 @@ use std::{
     str::FromStr,
 };
 
-use minijinja::{context, Environment, Template};
+use minijinja::{Environment, Template, Value};
 use serde::Serialize;
 use tokenizers::Encoding;
 
@@ -237,6 +237,7 @@ where
     pub chat_template_id: Option<&'a str>,
     pub add_generation_prompt: Option<bool>,
     pub continue_final_message: Option<bool>,
+    pub template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub fn load_model_chat_template_from_str(content: &str) -> std::io::Result<Option<String>> {
@@ -445,6 +446,7 @@ where
         chat_template_id,
         add_generation_prompt,
         continue_final_message,
+        template_kwargs,
     } = args;
 
     let add_generation_prompt = add_generation_prompt.unwrap_or(false);
@@ -472,6 +474,7 @@ where
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
+        template_kwargs,
     )
 }
 
@@ -482,6 +485,7 @@ fn render_jinja_tempalte<'a, R, T>(
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
+    template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>, Error>
 where
     R: Serialize + 'a,
@@ -493,11 +497,20 @@ where
     // TODO: what does checking for "messages" key do in the python code?
     let mut rendered = Vec::new();
     for chat in conversations {
-        let mut rendered_chat = template.render(context! {
-            messages => chat,
-            documents => documents,
-            add_generation_prompt => add_generation_prompt,
-        })?;
+        let mut context = serde_json::Map::new();
+        context.insert("messages".to_string(), serde_json::json!(chat));
+        context.insert("documents".to_string(), serde_json::json!(documents));
+        context.insert(
+            "add_generation_prompt".to_string(),
+            serde_json::json!(add_generation_prompt),
+        );
+        if let Some(template_kwargs) = &template_kwargs {
+            for (key, value) in template_kwargs {
+                context.insert(key.clone(), value.clone());
+            }
+        }
+
+        let mut rendered_chat = template.render(Value::from_serialize(context))?;
 
         if continue_final_message {
             let Some(final_message) = chat.last().map(|chat| &chat.content) else {
@@ -573,6 +586,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            template_kwargs: None,
         };
 
         let mut env = Environment::new();
@@ -609,6 +623,7 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            template_kwargs: None,
         };
 
         let rendered_chat = tokenizer
@@ -643,11 +658,42 @@ mod tests {
             chat_template_id: None,
             add_generation_prompt: None,
             continue_final_message: None,
+            template_kwargs: None,
         };
 
         let encodings = tokenizer
             .apply_chat_template_and_encode(model_chat_template, args)
             .unwrap();
         println!("{:?}", encodings.iter().map(|e| e.get_ids()).flatten());
+    }
+
+    #[test]
+    fn test_apply_chat_template_with_template_kwargs() {
+        let file = fixtures_dir().join("tokenizer_config.json");
+        let model_chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
+        let model_id = "mlx-community/Qwen3-4B-bf16".to_string();
+        let conversations = vec![Conversation {
+            role: Role::User,
+            content: "hello",
+        }];
+        let args = ApplyChatTemplateArgs {
+            conversations: [conversations.into()],
+            documents: None,
+            model_id: &model_id,
+            chat_template_id: None,
+            add_generation_prompt: Some(true),
+            continue_final_message: None,
+            template_kwargs: Some(serde_json::Map::from_iter([(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(false),
+            )])),
+        };
+
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+
+        let rendered_chat = apply_chat_template(&mut env, model_chat_template, args).unwrap();
+        assert_eq!(rendered_chat.len(), 1);
+        assert!(rendered_chat[0].contains("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 }
